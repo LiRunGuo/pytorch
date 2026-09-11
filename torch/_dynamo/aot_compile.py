@@ -4,6 +4,7 @@ import io
 import logging
 import os
 import pickle
+import sys
 import tempfile
 import types
 from collections.abc import Callable, Sequence
@@ -76,6 +77,7 @@ class _ProbeState:
     # must not re-probe or re-warn.
     attributes: dict[int, dict[str, Any]] = dataclasses.field(default_factory=dict)
     docs: dict[int, Any] = dataclasses.field(default_factory=dict)
+    annotations: dict[int, dict[str, Any]] = dataclasses.field(default_factory=dict)
     # Whether a probe short-circuited on an in-flight id; such a verdict is
     # not cached as final but parked (as unpicklable) for the rest of the
     # probe tree.
@@ -134,19 +136,23 @@ class AOTCompilePickler(FunctionPicklerBase):
                 return reduced
         elif inspect.isfunction(obj) and not self._fqn_resolves(obj):
             # The runtime env has to RUN this function, so unlike the guard
-            # pickler nothing it holds is pruned -- except __doc__ and __dict__
-            # entries that will not pickle. The runtime assigns those back and
-            # never forces the pruned ones, so a value this pickler cannot
-            # serialize (a __dict__ entry like the __wrapped__ functools.wraps
-            # stashes, which can drag an unrelated lock/Module in) is dropped
-            # rather than left to fail the whole dump.
+            # pickler nothing it holds is pruned -- except annotations, __doc__,
+            # and __dict__ entries that will not pickle. The runtime assigns
+            # those back and never forces the pruned ones, so a value this
+            # pickler cannot serialize (a <locals> annotation class, or a
+            # __dict__ entry like the __wrapped__ functools.wraps stashes, which
+            # can drag an unrelated lock/Module in) is dropped rather than left
+            # to fail the whole dump. Known limitation: the top-level function's
+            # own annotations ride on CompileArtifacts.signature, which
+            # serialize() dumps unpruned, so this only protects the nested
+            # functions reached here.
             return self._reduce_function(
                 obj,
                 defaults=obj.__defaults__,
                 kwdefaults=obj.__kwdefaults__,
                 closure=obj.__closure__,
                 attributes=self._pickleable_attributes(obj),
-                annotations={},
+                annotations=self._pickleable_annotations(obj),
                 doc=self._pickleable_doc(obj),
                 type_params=None,
                 globals_snapshot=None,
@@ -298,6 +304,54 @@ class AOTCompilePickler(FunctionPicklerBase):
             state.parked.clear()
             state.leaned = False
         return result
+
+    def _pickleable_annotations(self, obj: Any) -> dict[str, Any]:
+        # The runtime must SERIALIZE these, so on 3.14 ask for evaluated VALUEs
+        # rather than the FORWARDREF proxies the guard pickler reads: a proxy
+        # must not be carried (it holds its owner and may drag the owner's
+        # globals along). Evaluating runs the function's __annotate__ and
+        # caches the result on it, the same thing inspect.signature does; when
+        # it raises -- a TYPE_CHECKING-only name is the common case -- the whole
+        # set is dropped, since __annotate__ is one function returning the whole
+        # dict (a FORWARDREF retry that keeps the proxy-free values would
+        # salvage the siblings; not done). Below 3.14 __annotations__ is the
+        # live dict; its items are snapshotted, since a probe runs user
+        # __reduce__ code that may write back onto the function, and the kept
+        # values go into a fresh dict. A value can still be unpicklable -- a
+        # <locals> class resolves fine yet pickle cannot reference it -- so
+        # probe each and keep only the ones that dump, warning per drop like a
+        # __dict__ entry. Memoized for the real dump like the attributes.
+        state = self._probe_state
+        if not self._probing and id(obj) in state.annotations:
+            return state.annotations[id(obj)]
+        if sys.version_info >= (3, 14):
+            import annotationlib
+
+            try:
+                annotations = annotationlib.get_annotations(
+                    obj, format=annotationlib.Format.VALUE
+                )
+            except Exception as e:
+                code = obj.__code__
+                log.debug(
+                    "dropping the annotations of %s (%s:%d): %s",
+                    getattr(code, "co_qualname", code.co_name),
+                    code.co_filename,
+                    code.co_firstlineno,
+                    e,
+                )
+                annotations = {}
+        else:
+            annotations = obj.__annotations__
+        kept = {}
+        for name, value in list(annotations.items()):
+            if self._dumps_cleanly(value):
+                kept[name] = value
+            else:
+                self._warn_dropped(obj, f"__annotations__[{name!r}]", value)
+        if not self._probing:
+            state.annotations[id(obj)] = kept
+        return kept
 
 
 class AOTCompileUnpickler(pickle.Unpickler):
