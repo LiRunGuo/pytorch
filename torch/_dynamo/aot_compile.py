@@ -33,6 +33,10 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+_EXTERNAL_DATA_HINT = (
+    "Mark the value(s) as external data by using `external_data={'key': ...}`."
+)
+
 
 def bind_locals(
     signature: inspect.Signature, *args: Any, **kwargs: Any
@@ -486,11 +490,45 @@ class AOTCompiledFunction:
         state["original_code"] = SerializedCode.from_code_object(state["original_code"])
         buf = io.BytesIO()
         pickler = AOTCompilePickler(external_data or {}, buf)
-        pickler.dump(state)
+        try:
+            pickler.dump(state)
+        except (pickle.PicklingError, TypeError, AttributeError, RecursionError) as e:
+            # Preserve the original exception object -- callers and tests match
+            # on it (e.g. "cannot pickle '_thread.lock' object") -- and append
+            # guidance. Mutate args and re-raise rather than type(e)(msg): a
+            # TypeError subclass from a user __reduce__ may take a non-message
+            # constructor, so reconstructing would swap the real error for a
+            # constructor failure. (A subclass whose __str__ ignores args still
+            # renders without the guidance; add_note() would cover it but is
+            # 3.11+.) The args tail is kept for a consumer that reads it.
+            # AttributeError is caught too: the C _pickle accelerator raises a
+            # bare AttributeError "Can't get local object" for a <locals> class
+            # in a default/kwdefault (3.14+ raises PicklingError), so it needs
+            # the same guidance. RecursionError as well: a deep-but-finite value
+            # in an unpruned slot overflows the C pickler, and external_data is
+            # its fix too. Unmarked modules recorded before the failure are
+            # reported here rather than on the next attempt.
+            # str(e) is repr(args) for a 2+-argument exception, which would nest
+            # the tuple repr and escape the newline; the head argument is the
+            # message. str(e) of the result is still a tuple repr in that case,
+            # which is the price of keeping the tail.
+            message = str(e.args[0]) if e.args else ""
+            prefix = f"{message}\n" if message else ""
+            modules = ""
+            if pickler.errors:
+                modules = f" It also reached these unmarked nn.Modules: {list(pickler.errors.values())}."
+            e.args = (
+                prefix + "Some value reached by the artifact is not picklable (a "
+                "closure cell, a default/kwdefault, or the top-level function's "
+                "own signature annotations, which ride unpruned, are the common "
+                f"sources).{modules} {_EXTERNAL_DATA_HINT}",
+                *e.args[1:],
+            )
+            raise
         if pickler.errors:
             raise RuntimeError(
                 f"Failed to serialize the following objects: {list(pickler.errors.values())}\n"
-                "Please mark these as external data by using `external_data={'key': ...}`"
+                f"{_EXTERNAL_DATA_HINT}"
             )
         return AOTCompileSaveResult(serialized_data=buf.getvalue())
 
