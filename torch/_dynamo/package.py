@@ -116,10 +116,9 @@ class FunctionPicklerBase(pickle.Pickler):
     closure cells, python modules, bound methods, and functions rebuilt from
     their code object.
 
-    GuardsStatePickler is the one subclass today and decides what a rebuilt
-    function carries; this class fixes HOW it is rebuilt. AOTCompilePickler
-    keeps its own copies of these reducers until it is moved onto this base
-    separately; once both share it, a fix here cannot be missed in one pickler.
+    GuardsStatePickler and AOTCompilePickler each keep their own dispatch and
+    decide what a rebuilt function carries; this class fixes HOW it is rebuilt,
+    so a fix here cannot be missed in one pickler.
 
     Defaults, kwdefaults, __doc__, __dict__, __annotations__ and __type_params__
     travel as pickle STATE, applied after memoization, so `wrapper.me = wrapper`
@@ -323,10 +322,15 @@ class FunctionPicklerBase(pickle.Pickler):
             type(self)._set_cell_contents,
         )
 
-    def _reduce_bound_method(self, method: types.MethodType) -> tuple[Any, ...] | None:
+    def _reduce_bound_method(
+        self, method: types.MethodType, *, receiver_is_live: bool = False
+    ) -> tuple[Any, ...] | None:
         # pickle rebuilds a bound method by getattr() on self at load, which is
         # wrong when that does not resolve back to the same bound method; those
-        # carry the function and self explicitly.
+        # carry the function and self explicitly. `receiver_is_live` says the
+        # receiver is the SAME object at load (a persistent_id reference), so
+        # only the probe below decides: the per-instance and __getattr__ gates
+        # exist for a receiver that is rebuilt, possibly as a different type.
         receiver = method.__self__
         cls = type(receiver)
         func = method.__func__
@@ -348,7 +352,7 @@ class FunctionPicklerBase(pickle.Pickler):
         # restored with the class. issubclass(cls, ...) rather than isinstance
         # so a raising __getattribute__ cannot escape before the try below.
         explicit = (type(self)._unpickle_bound_method, (func, receiver))
-        is_type = issubclass(cls, type)
+        is_type = issubclass(cls, type) or receiver_is_live
         try:
             if not is_type and hasattr(cls, "__getattr__"):
                 return explicit
