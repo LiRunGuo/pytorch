@@ -1292,6 +1292,45 @@ class TestGuardsStatePickler(torch._inductor.test_case.TestCase):
         out = pickle.loads(buf.getvalue())["fn"]
         self.assertEqual(out.__module__, ["not", "a", "module"])
 
+    def test_fqn_resolves_only_when_pickle_by_name_lands_on_the_function(self):
+        # The shared test behind "rebuild from the code object or not": True
+        # only when importing __module__ and walking __qualname__ gets this
+        # exact object back, which is what pickle's by-reference path does.
+        resolves = GuardsStatePickler._fqn_resolves
+        self.assertTrue(resolves(global_func))
+        self.assertTrue(resolves(PlainMethods.add))  # a dotted qualname walk
+
+        def local_fn(x):
+            return x
+
+        wrapper = functools.wraps(global_func)(lambda x: global_func(x))
+        self.assertEqual(
+            (wrapper.__module__, wrapper.__qualname__), (__name__, "global_func")
+        )
+        renamed = types.FunctionType(global_func.__code__, globals(), "global_func")
+        renamed.__qualname__ = "no_such_name"
+        exec_fn = types.FunctionType(
+            global_func.__code__, {"__name__": "_not_in_sys_modules"}, "global_func"
+        )
+        odd = types.FunctionType(global_func.__code__, globals(), "global_func")
+        odd.__module__ = ["not", "a", "module"]  # unhashable: must not TypeError
+        # The oracle is pickle itself: every False case fails a by-reference
+        # dump (the C pickler raises a bare AttributeError for a <locals> name).
+        cases = {
+            "locals": local_fn,
+            "wraps_wrapper": wrapper,
+            "bad_qualname": renamed,
+            "module_not_imported": exec_fn,
+            "unhashable_module": odd,
+        }
+        for case, fn in cases.items():
+            with self.subTest(case=case):
+                self.assertFalse(resolves(fn))
+                with self.assertRaises(
+                    (pickle.PicklingError, AttributeError, TypeError)
+                ):
+                    pickle.dumps(fn)
+
     def test_pruned_shared_closure_cell_stays_shared(self):
         # An unguarded shared cell prunes to a single _Missing cell, and the two
         # functions closing over it must still share that one pruned cell;
